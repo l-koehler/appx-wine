@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Installs and runs Windows 8/8.1 APPX packages under Wine with the WinRT/XAML shim.
+#   appx-wine install DIR PACKAGE.appx [DEPENDENCY.appx...]
+#   appx-wine run DIR [ARGS...]
+# DIR gets app/ (extracted package), build/ (shim) and prefix/ (Wine prefix). Safe to re-run.
+# Needs the tools from shell.nix.
+set -euo pipefail
+tool=$(cd "$(dirname "$0")" && pwd)
+sdk_url=https://www.nuget.org/api/v2/package/Microsoft.Windows.SDK.Contracts/10.0.19041.1
+sdk_sha256=7dc674587605f02b0b22266071834dd6e23efaeed0d615c2a7f1c2601c18698d
+sdk_dir=${APPX_WINE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/appx-wine}/sdk-contracts-10.0.19041.1
+
+usage() {
+    sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//' >&2
+    exit 1
+}
+
+manifest() {
+    python3 -I "$tool/tools/manifest.py" "$dir/app/AppxManifest.xml" "$1"
+}
+
+# APPX stores file names percent-encoded ("monkirta%20pursuit%20nc.ttf")
+extract() {
+    7zz x -y -o"$2" "$1" >/dev/null
+    find "$2" -depth -name '*%[0-9A-Fa-f][0-9A-Fa-f]*' -print0 |
+        while IFS= read -r -d '' f; do
+            mv -n "$f" "$(dirname "$f")/$(python3 -I -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "$(basename "$f")")"
+        done
+}
+
+fetch_sdk() {
+    [ -d "$sdk_dir/ref/netstandard2.0" ] && return
+    echo ">> fetching Windows SDK metadata (NuGet Microsoft.Windows.SDK.Contracts)"
+    mkdir -p "$sdk_dir"
+    curl -sSL -o "$sdk_dir.nupkg" "$sdk_url"
+    echo "$sdk_sha256  $sdk_dir.nupkg" | sha256sum -c - >/dev/null
+    unzip -q -o "$sdk_dir.nupkg" -d "$sdk_dir"
+    rm "$sdk_dir.nupkg"
+}
+
+install() {
+    local package=$1
+    shift
+    if [ ! -f "$dir/app/AppxManifest.xml" ]; then
+        echo ">> extracting $(basename "$package")"
+        extract "$package" "$dir/app"
+    fi
+    if [ "$(manifest arch)" != x86 ]; then
+        echo "only x86 packages are supported (this one is $(manifest arch))" >&2
+        exit 1
+    fi
+    echo ">> declared dependencies:"
+    manifest dependencies | sed 's/^/   /'
+    for dep in "$@"; do
+        echo ">> adding DLLs from $(basename "$dep")"
+        rm -rf "$dir/deps/$(basename "$dep")"
+        extract "$dep" "$dir/deps/$(basename "$dep")"
+        cp "$dir/deps/$(basename "$dep")"/*.dll "$dir/app/"
+    done
+
+    fetch_sdk
+    echo ">> building shim"
+    make -s -C "$tool" APP="$dir/app" BUILD="$dir/build" SDK="$sdk_dir/ref/netstandard2.0"
+    cp "$dir/build/winrtshim.dll" "$dir/app/"
+
+    export WINEPREFIX="$dir/prefix" WINEDEBUG=-all
+    if [ ! -f "$WINEPREFIX/system.reg" ]; then
+        echo ">> creating wine prefix"
+        wineboot -i
+        wineserver -w
+    fi
+
+    echo ">> disabling winedbg on crashes (the shim logs its own backtrace)"
+    for view in 32 64; do
+        wine reg delete 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug' /v Debugger /f /reg:$view >/dev/null 2>&1 || true
+    done
+    wine reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f >/dev/null
+
+    # Wine's builtin VC runtimes disagree with the packaged vccorlib about the WinRT exception layout
+    local exe dll
+    exe=$(manifest executable)
+    for dll in "$dir"/app/msvc[rp]1[0-9]*.dll "$dir"/app/vccorlib*.dll; do
+        [ -f "$dll" ] || continue
+        dll=$(basename "$dll" .dll)
+        echo ">> preferring native $dll for $exe"
+        wine reg add "HKCU\\Software\\Wine\\AppDefaults\\$exe\\DllOverrides" /v "$dll" /d native /f >/dev/null
+    done
+
+    echo ">> registering shim classes"
+    wine reg export 'HKLM\Software\Microsoft\WindowsRuntime\ActivatableClassId' "$(winepath -w "$dir/build/current.reg")" /reg:32 /y >/dev/null
+    python3 -I "$tool/tools/gen_reg.py" "$dir/build/winrt_meta.c" "$dir/build/current.reg" \
+        "$(winepath -w "$dir/app/winrtshim.dll")" "$dir/build/winrtshim.reg"
+    wine 'C:\windows\syswow64\regedit.exe' /S "$(winepath -w "$dir/build/winrtshim.reg")"
+    wineserver -w
+    echo ">> done; start with: $0 run $dir"
+}
+
+run() {
+    export WINEPREFIX="$dir/prefix"
+    export WINEDEBUG="${WINEDEBUG:--all,err}"
+    export SHIM_LOG="${SHIM_LOG:-$(winepath -w "$dir/shim.log")}"
+    local exe
+    exe=$(manifest executable)
+    cd "$dir/app"
+    exec wine "$exe" "$@"
+}
+
+[ $# -ge 2 ] || usage
+cmd=$1
+dir=$(mkdir -p "$2" && cd "$2" && pwd)
+shift 2
+case $cmd in
+install)
+    [ $# -ge 1 ] || usage
+    install "$@"
+    ;;
+run) run "$@" ;;
+*) usage ;;
+esac
