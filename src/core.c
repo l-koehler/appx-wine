@@ -429,7 +429,7 @@ void prop_set_raw(struct obj *o, const char *name, const void *data, int size)
 
 static INT64 next_token = 1;
 
-static void event_add(struct obj *o, const char *name, IUnknown *h, INT64 *token)
+void event_add(struct obj *o, const char *name, IUnknown *h, INT64 *token)
 {
     struct event *e = calloc(1, sizeof(*e));
     snprintf(e->name, sizeof(e->name), "%s", name);
@@ -692,6 +692,14 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep)
                 }
             }
             shim_log("C++ exception:%s", line);
+            /* the game is built with frame pointers: follow the EBP chain for exact callers */
+            line[0] = 0;
+            k = 0;
+            for (DWORD *fp = (DWORD *)c->Ebp; k < 16 && fp && !IsBadReadPtr(fp, 8); fp = (DWORD *)fp[0], k++) {
+                snprintf(line + strlen(line), sizeof(line) - strlen(line), " %s", (n = addr_name(fp[1])) ? n : "?");
+                if ((DWORD *)fp[0] <= fp) break;
+            }
+            shim_log("  frames:%s", line);
         }
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -715,12 +723,38 @@ static void dump_stack(DWORD *sp, int words)
     }
 }
 
+/* SHIM_WATCHDOG_ALL=1: also dump the stacks of all other threads (once, at the first idle report) */
+static void dump_other_threads(void)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te = {.dwSize = sizeof(te)};
+    if (snap == INVALID_HANDLE_VALUE) return;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        HANDLE th;
+        CONTEXT c = {.ContextFlags = CONTEXT_FULL};
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == main_tid ||
+            te.th32ThreadID == GetCurrentThreadId())
+            continue;
+        if (!(th = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID))) continue;
+        if (SuspendThread(th) != (DWORD)-1) {
+            if (GetThreadContext(th, &c)) {
+                shim_log("thread %04lx: eip %08lx (%s)", te.th32ThreadID, c.Eip, addr_name(c.Eip) ?: "?");
+                dump_stack((DWORD *)c.Esp, 256);
+            }
+            ResumeThread(th);
+        }
+        CloseHandle(th);
+    }
+    CloseHandle(snap);
+}
+
 /* SHIM_WATCHDOG=<seconds>: dump the main thread's stack whenever it makes no WinRT calls for that long */
 static DWORD WINAPI watchdog(void *arg)
 {
     int secs = (int)(INT_PTR)arg;
     HANDLE th = OpenThread(THREAD_ALL_ACCESS, FALSE, main_tid);
     LONG last = -1;
+    int dumped_all = 0;
     for (;;) {
         Sleep(secs * 1000);
         if (call_total == last) {
@@ -730,11 +764,19 @@ static DWORD WINAPI watchdog(void *arg)
             shim_log("watchdog: main thread idle, eip %08lx (%s)", c.Eip, addr_name(c.Eip) ?: "?");
             dump_stack((DWORD *)c.Esp, 512);
             ResumeThread(th);
+            if (!dumped_all && GetEnvironmentVariableA("SHIM_WATCHDOG_ALL", NULL, 0)) {
+                dumped_all = 1;
+                dump_other_threads();
+            }
         }
         last = call_total;
     }
     return 0;
 }
+
+/* the hooks replace these imports in every module, this one included, so call the implementations directly */
+static void(WINAPI *real_exit_process)(UINT);
+static BOOL(WINAPI *real_terminate_process)(HANDLE, UINT);
 
 static void WINAPI hook_exit_process(UINT code)
 {
@@ -742,7 +784,7 @@ static void WINAPI hook_exit_process(UINT code)
     __asm__ volatile("mov %%esp, %0" : "=r"(sp));
     shim_log("ExitProcess(%u)", code);
     dump_stack(sp, 512);
-    ExitProcess(code);
+    real_exit_process(code);
 }
 
 static BOOL WINAPI hook_terminate_process(HANDLE h, UINT code)
@@ -751,7 +793,7 @@ static BOOL WINAPI hook_terminate_process(HANDLE h, UINT code)
     __asm__ volatile("mov %%esp, %0" : "=r"(sp));
     shim_log("TerminateProcess(%p, %u)", h, code);
     dump_stack(sp, 512);
-    return TerminateProcess(h, code);
+    return real_terminate_process(h, code);
 }
 
 /* ---- entry points ---- */
@@ -785,6 +827,9 @@ void shim_init(void)
     af_vtbl[6] = af_activate;
     AddVectoredExceptionHandler(1, crash_handler);
     main_tid = GetCurrentThreadId();
+    real_exit_process = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "ExitProcess");
+    real_terminate_process = (void *)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "TerminateProcess");
+    if (!real_exit_process) real_exit_process = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "ExitProcess");
     patch_import("ExitProcess", hook_exit_process);
     patch_import("TerminateProcess", hook_terminate_process);
     if (GetEnvironmentVariableA("SHIM_WATCHDOG", path, sizeof(path)))

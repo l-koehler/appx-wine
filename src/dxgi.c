@@ -9,6 +9,7 @@ static HRESULT(WINAPI *orig_for_hwnd)(IDXGIFactory2 *, IUnknown *, HWND, const D
 
 /* frame dumps: F12, or every SHIM_DUMP_EVERY seconds; written to SHIM_DUMP_DIR (default ..\\frames) */
 static HRESULT(WINAPI *orig_present)(IDXGISwapChain *, UINT, UINT);
+static HRESULT(WINAPI *orig_present1)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
 static int dump_every, dump_count;
 static DWORD next_dump;
 static WCHAR dump_dir[MAX_PATH] = L"..\\frames";
@@ -25,7 +26,11 @@ static void dump_frame(IDXGISwapChain *sc)
     HANDLE f;
     DWORD w;
 
-    if (FAILED(IDXGISwapChain_GetBuffer(sc, 0, &IID_ID3D11Texture2D, (void **)&tex))) return;
+    HRESULT hr;
+    if (FAILED(hr = IDXGISwapChain_GetBuffer(sc, 0, &IID_ID3D11Texture2D, (void **)&tex))) {
+        shim_log("frame dump: GetBuffer failed %08lx", hr);
+        return;
+    }
     ID3D11Texture2D_GetDevice(tex, &dev);
     ID3D11Device_GetImmediateContext(dev, &ctx);
     ID3D11Texture2D_GetDesc(tex, &desc);
@@ -33,7 +38,9 @@ static void dump_frame(IDXGISwapChain *sc)
     desc.BindFlags = 0;
     desc.MiscFlags = 0;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    if (SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &desc, NULL, &staging))) {
+    if (FAILED(hr = ID3D11Device_CreateTexture2D(dev, &desc, NULL, &staging)))
+        shim_log("frame dump: CreateTexture2D failed %08lx", hr);
+    else {
         ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)tex);
         if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map))) {
             BITMAPFILEHEADER fh = {0x4d42};
@@ -71,15 +78,29 @@ static void dump_frame(IDXGISwapChain *sc)
     ID3D11Texture2D_Release(tex);
 }
 
-static HRESULT WINAPI hook_present(IDXGISwapChain *sc, UINT interval, UINT flags)
+static void maybe_dump(IDXGISwapChain *sc)
 {
     DWORD now = GetTickCount();
+    static volatile LONG presents;
+    LONG n = InterlockedIncrement(&presents);
+    if (n == 1 || n % 600 == 0) shim_log("Present #%ld", n);
     if (dump_requested || (dump_every && (int)(now - next_dump) > 0)) {
         dump_requested = 0;
         next_dump = now + dump_every * 1000;
         dump_frame(sc);
     }
+}
+
+static HRESULT WINAPI hook_present(IDXGISwapChain *sc, UINT interval, UINT flags)
+{
+    maybe_dump(sc);
     return orig_present(sc, interval, flags);
+}
+
+static HRESULT WINAPI hook_present1(IDXGISwapChain1 *sc, UINT interval, UINT flags, const DXGI_PRESENT_PARAMETERS *p)
+{
+    maybe_dump((IDXGISwapChain *)sc);
+    return orig_present1(sc, interval, flags, p);
 }
 
 static void hook_swapchain(IDXGISwapChain1 *sc)
@@ -95,6 +116,10 @@ static void hook_swapchain(IDXGISwapChain1 *sc)
     orig_present = vt[8];
     vt[8] = hook_present;
     VirtualProtect(&vt[8], 4, old, &old);
+    VirtualProtect(&vt[22], 4, PAGE_READWRITE, &old);
+    orig_present1 = vt[22];
+    vt[22] = hook_present1;
+    VirtualProtect(&vt[22], 4, old, &old);
 }
 
 static HRESULT make_swapchain(IDXGIFactory2 *f, IUnknown *dev, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *out,

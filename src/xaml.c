@@ -27,7 +27,14 @@ static void run_queue(void)
     while (w) {
         struct work *next = w->next;
         struct prop *p;
-        invoke0(w->handler);
+        {
+            static int ran;
+            int k = ran++ < 20;
+            HRESULT hr;
+            if (k) shim_log("run_queue: invoking %p on thread %lu", w->handler, GetCurrentThreadId());
+            hr = invoke0(w->handler);
+            if (k) shim_log("run_queue: handler %p returned %08lx", w->handler, hr);
+        }
         IUnknown_Release(w->handler);
         prop_set_raw(w->action, "Status", &(int){1}, 4);
         if ((p = prop_find(w->action, "Completed")) && p->v.unk)
@@ -40,6 +47,8 @@ static void run_queue(void)
 static HRESULT WINAPI disp_run_async(struct tear *t, int prio, IUnknown *handler, void **action)
 {
     struct work *w = calloc(1, sizeof(*w));
+    static int logged;
+    if (logged++ < 20) shim_log("Dispatcher.RunAsync prio %d from thread %lu", prio, GetCurrentThreadId());
     w->handler = handler;
     IUnknown_AddRef(handler);
     w->action = obj_new_iface(find_iface("Windows.Foundation.IAsyncAction"));
@@ -118,6 +127,9 @@ static HRESULT WINAPI cwi_put_msg(struct tear *t, boolean v)
 }
 static void *cwi_vtbl[8];
 
+static void fire_element_sizes(void);
+
+
 static void fire_size_changed(void)
 {
     struct obj *args = obj_new_named("Windows.UI.Core.WindowSizeChangedEventArgs");
@@ -126,6 +138,70 @@ static void fire_size_changed(void)
     prop_set_raw(args, "Size", sz, 8);
     event_fire(core_window, "SizeChanged", obj_iface(core_window, "Windows.UI.Core.ICoreWindow"), obj_default(args));
     event_fire(xaml_window, "SizeChanged", obj_identity(xaml_window), obj_default(args));
+    fire_element_sizes();
+}
+
+/* ---- element sizes: every element fills the window ---- */
+
+static struct obj *sized[64];
+static int nsized;
+
+/* every element covers the whole window at its origin, so transforms between them are the identity */
+struct point { float x, y; };
+struct rect { float x, y, w, h; };
+
+static HRESULT WINAPI gt_transform_point(struct tear *t, struct point p, void *out)
+{
+    memcpy(out, &p, sizeof(p));
+    return S_OK;
+}
+
+static HRESULT WINAPI gt_try_transform(struct tear *t, struct point p, void *out, boolean *ok)
+{
+    memcpy(out, &p, sizeof(p));
+    *ok = 1;
+    return S_OK;
+}
+
+static HRESULT WINAPI gt_transform_bounds(struct tear *t, struct rect r, void *out)
+{
+    memcpy(out, &r, sizeof(r));
+    return S_OK;
+}
+
+static HRESULT WINAPI fe_get_actual_size(struct tear *t, double *v)
+{
+    float w, h;
+    client_size(&w, &h);
+    *v = w;
+    return S_OK;
+}
+
+static HRESULT WINAPI fe_get_actual_height(struct tear *t, double *v)
+{
+    float w, h;
+    client_size(&w, &h);
+    *v = h;
+    return S_OK;
+}
+
+static HRESULT WINAPI fe_add_size_changed(struct tear *t, IUnknown *h, INT64 *token)
+{
+    event_add(t->obj, "SizeChanged", h, token);
+    if (nsized < 64) sized[nsized++] = t->obj;
+    return S_OK;
+}
+
+static void fire_element_sizes(void)
+{
+    for (int i = 0; i < nsized; i++) {
+        struct obj *args = obj_new_named("Windows.UI.Xaml.SizeChangedEventArgs");
+        float sz[2];
+        client_size(&sz[0], &sz[1]);
+        prop_set_raw(args, "NewSize", sz, 8);
+        prop_set_raw(args, "PreviousSize", sz, 8);
+        event_fire(sized[i], "SizeChanged", obj_identity(sized[i]), obj_default(args));
+    }
 }
 
 static void fire_visibility(int visible)
@@ -207,6 +283,7 @@ static HRESULT WINAPI cw_statics_current(struct tear *t, void **out)
 /* ---- XAML loading ---- */
 
 static const GUID IID_ISwapChainBackgroundPanelNative = {0x43bebd4e, 0xadd5, 0x4035, {0x8f, 0x85, 0x56, 0x08, 0xd0, 0x8e, 0x9d, 0xc9}};
+static const GUID IID_ISwapChainPanelNative = {0xf92f19d2, 0x3ade, 0x45a6, {0xa2, 0x0c, 0xf6, 0xf1, 0xea, 0x90, 0x55, 0x4b}};
 static void *scbp_vtbl[4];
 static HRESULT WINAPI scbp_set_swapchain(struct tear *t, IUnknown *sc)
 {
@@ -257,6 +334,20 @@ struct media_pending {
 };
 static struct media_pending media[8];
 static int nmedia;
+
+/* a MediaElement created in code ends right away, like those from XAML */
+static HRESULT WINAPI me_add_media_ended(struct tear *t, IUnknown *h, INT64 *token)
+{
+    int i;
+    event_add(t->obj, "MediaEnded", h, token);
+    for (i = 0; i < nmedia && media[i].o; i++) {}
+    if (i < 8) {
+        media[i].o = t->obj;
+        media[i].when = GetTickCount() + 500;
+        if (i == nmedia) nmedia++;
+    }
+    return S_OK;
+}
 
 static HRESULT load_xaml(IInspectable *component, const WCHAR *path)
 {
@@ -417,6 +508,8 @@ static HRESULT WINAPI uri_create2(struct tear *t, HSTRING base, HSTRING rel, voi
 
 static void on_compose(struct obj *o)
 {
+    /* UWP apps create the SwapChainPanel in code; its native interface has the same layout */
+    if (!strcmp(o->name, "Windows.UI.Xaml.Controls.SwapChainPanel")) obj_add_custom(o, &IID_ISwapChainPanelNative, scbp_vtbl);
     /* the framework keeps Application.Current alive */
     if (!strcmp(o->name, "Windows.UI.Xaml.Application")) {
         app_obj = o;
@@ -435,6 +528,46 @@ static HRESULT WINAPI app_statics_current(struct tear *t, void **out)
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static DWORD autotap;
+
+/* closing the window suspends the app first, like Windows does; games save their state then */
+static volatile LONG open_deferrals;
+
+static HRESULT WINAPI suspend_get_deferral(struct tear *t, void **out)
+{
+    InterlockedIncrement(&open_deferrals);
+    *out = obj_default(obj_new_named("Windows.ApplicationModel.SuspendingDeferral"));
+    return S_OK;
+}
+
+static HRESULT WINAPI suspend_complete(struct tear *t)
+{
+    if (!t->obj->priv) {
+        t->obj->priv = t->obj;
+        InterlockedDecrement(&open_deferrals);
+    }
+    return S_OK;
+}
+
+static void suspend_app(void)
+{
+    struct obj *args = obj_new_named("Windows.ApplicationModel.SuspendingEventArgs");
+    struct obj *op = obj_new_named("Windows.ApplicationModel.SuspendingOperation");
+    FILETIME ft;
+    INT64 deadline;
+    DWORD end = GetTickCount() + 5000;
+    GetSystemTimeAsFileTime(&ft);
+    deadline = ((INT64)ft.dwHighDateTime << 32 | ft.dwLowDateTime) + 5 * 10000000LL;
+    prop_set_raw(op, "Deadline", &deadline, 8);
+    prop_set_unk(args, "SuspendingOperation", obj_default(op));
+    shim_log("suspending");
+    event_fire(app_obj, "Suspending", obj_identity(app_obj), obj_default(args));
+    /* deferred work may need the dispatcher; Windows allows about 5 seconds */
+    while (open_deferrals > 0 && (int)(GetTickCount() - end) < 0) {
+        pump();
+        Sleep(5);
+    }
+    shim_log("suspended (%ld deferrals still open)", open_deferrals);
+}
 
 /* SHIM_TAPS="<s>:<x>,<y>;...": scripted clicks (seconds after start, client coordinates);
  * "<s>:key=<vk>" presses a virtual key instead */
@@ -549,7 +682,10 @@ static HRESULT WINAPI app_start(struct tear *t, IUnknown *callback)
         }
         run_taps(now);
         pump();
-        fire_loaded();
+        if (npending_loaded) {
+            fire_loaded();
+            fire_size_changed();
+        }
         for (int i = 0; i < nmedia; i++)
             if (media[i].o && (int)(now - media[i].when) > 0) {
                 struct obj *a = obj_new_named("Windows.UI.Xaml.RoutedEventArgs");
@@ -564,10 +700,60 @@ static HRESULT WINAPI app_start(struct tear *t, IUnknown *callback)
         } else Sleep(5);
     }
     shim_log("main loop exit");
+    if (app_obj) {
+        suspend_app();
+        /* Windows terminates a suspended app that is closed; the game's own shutdown would wait for threads
+         * it paused while suspending */
+        shim_log("terminating");
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
     return S_OK;
 }
 
 /* ---- input ---- */
+
+/* typed characters go to the TextBox the game focused last (games use hidden ones for text entry) */
+static struct obj *focused_textbox;
+
+static HRESULT WINAPI control_focus(struct tear *t, int state, boolean *result)
+{
+    if (!strcmp(t->obj->name, "Windows.UI.Xaml.Controls.TextBox")) {
+        struct obj *a = obj_new_named("Windows.UI.Xaml.RoutedEventArgs");
+        shim_log("TextBox focused");
+        focused_textbox = t->obj;
+        event_fire(t->obj, "GotFocus", obj_identity(t->obj), obj_default(a));
+    }
+    if (result) *result = 1;
+    return S_OK;
+}
+
+static int prop_bool(struct obj *o, const char *name, int dflt)
+{
+    struct prop *p = prop_find(o, name);
+    return p ? p->v.raw[0] != 0 : dflt;
+}
+
+static void textbox_char(WCHAR c)
+{
+    struct obj *tb = focused_textbox;
+    struct prop *p;
+    WCHAR text[256] = L"";
+    int len, max;
+    if (!tb || prop_bool(tb, "IsReadOnly", 0) || !prop_bool(tb, "IsEnabled", 1)) return;
+    if ((p = prop_find(tb, "Text")) && p->v.str) wcsncpy(text, WindowsGetStringRawBuffer(p->v.str, NULL), 255);
+    len = wcslen(text);
+    max = (p = prop_find(tb, "MaxLength")) ? *(int *)p->v.raw : 0;
+    if (c == '\b') {
+        if (!len) return;
+        text[len - 1] = 0;
+    } else if (c >= ' ' && len < 255 && (max <= 0 || len < max)) {
+        text[len] = c;
+        text[len + 1] = 0;
+    } else return;
+    prop_set_str(tb, "Text", text);
+    event_fire(tb, "TextChanged", obj_identity(tb), obj_default(obj_new_named("Windows.UI.Xaml.Controls.TextChangedEventArgs")));
+}
+
 
 
 static void fire_pointer(const char *event, int x, int y, int wheel)
@@ -674,6 +860,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         fire_key("KeyUp", wp, lp);
         return 0;
     case WM_CHAR:
+        textbox_char(wp);
         return 0;
     case WM_ACTIVATE:
         if (core_window) fire_activated(LOWORD(wp) == WA_INACTIVE ? 2 : 0);
@@ -707,6 +894,16 @@ void xaml_init(void)
     override("Windows.UI.Xaml.IApplicationStatics", "LoadComponent#2", app_load_component2);
     override("Windows.UI.Xaml.IFrameworkElement", "FindName", fe_find_name);
     override("Windows.UI.Xaml.IWindowStatics", "get_Current", win_statics_current);
+    override("Windows.UI.Xaml.IFrameworkElement", "get_ActualWidth", fe_get_actual_size);
+    override("Windows.UI.Xaml.Media.IGeneralTransform", "TransformPoint", gt_transform_point);
+    override("Windows.UI.Xaml.Controls.IControl", "Focus", control_focus);
+    override("Windows.ApplicationModel.ISuspendingOperation", "GetDeferral", suspend_get_deferral);
+    override("Windows.ApplicationModel.ISuspendingDeferral", "Complete", suspend_complete);
+    override("Windows.UI.Xaml.Media.IGeneralTransform", "TryTransform", gt_try_transform);
+    override("Windows.UI.Xaml.Media.IGeneralTransform", "TransformBounds", gt_transform_bounds);
+    override("Windows.UI.Xaml.IFrameworkElement", "get_ActualHeight", fe_get_actual_height);
+    override("Windows.UI.Xaml.IFrameworkElement", "add_SizeChanged", fe_add_size_changed);
+    override("Windows.UI.Xaml.Controls.IMediaElement", "add_MediaEnded", me_add_media_ended);
     override("Windows.UI.Xaml.IWindow", "put_Content", win_put_content);
     override("Windows.UI.Xaml.IWindow", "Activate", win_activate);
     override("Windows.UI.Xaml.IWindow", "get_Bounds", cw_get_bounds);

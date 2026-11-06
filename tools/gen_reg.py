@@ -8,7 +8,10 @@ import sys
 
 # Wine implements these, but apps need the shim's behaviour
 FORCE = {"Windows.ApplicationModel.Package", "Windows.Storage.ApplicationData", "Windows.Foundation.Uri",
-         "Windows.Security.Cryptography.CryptographicBuffer", "Windows.Networking.Connectivity.NetworkInformation"}
+         "Windows.Security.Cryptography.CryptographicBuffer", "Windows.Networking.Connectivity.NetworkInformation",
+         "Windows.Security.ExchangeActiveSyncProvisioning.EasClientDeviceInformation",
+         "Windows.UI.ViewManagement.ApplicationView", "Windows.System.Profile.AnalyticsInfo",
+         "Windows.System.UserProfile.AdvertisingManager", "Windows.Devices.Enumeration.DeviceAccessInformation"}
 
 meta, existing, dll, out = sys.argv[1:5]
 src = open(meta).read()

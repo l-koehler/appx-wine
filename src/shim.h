@@ -115,6 +115,7 @@ struct obj *obj_new_named(const char *cls);
 void *obj_iface(struct obj *o, const char *iface);       /* no AddRef */
 void *obj_iface_idx(struct obj *o, int iface);
 void *obj_default(struct obj *o);
+void event_add(struct obj *o, const char *name, IUnknown *h, INT64 *token);
 void obj_add_custom(struct obj *o, const GUID *iid, void **vtbl);
 struct obj *obj_from(void *iface_ptr);                   /* NULL if not ours */
 struct obj *factory_for(int cls);

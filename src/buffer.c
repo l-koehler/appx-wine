@@ -248,6 +248,122 @@ static HRESULT WINAPI cb_to_string(struct tear *t, int encoding, IUnknown *b, HS
     return S_OK;
 }
 
+static HRESULT WINAPI cb_from_base64(struct tear *t, HSTRING s, void **out)
+{
+    UINT32 wl;
+    const WCHAR *w = WindowsGetStringRawBuffer(s, &wl);
+    DWORD n = 0;
+    struct obj *o;
+    if (!CryptStringToBinaryW(w, wl, CRYPT_STRING_BASE64_ANY, NULL, &n, NULL, NULL)) return E_INVALIDARG;
+    o = buffer_new(NULL, n);
+    CryptStringToBinaryW(w, wl, CRYPT_STRING_BASE64_ANY, ((struct buf *)o->priv)->data, &n, NULL, NULL);
+    *out = obj_default(o);
+    return S_OK;
+}
+
+static HRESULT WINAPI cb_from_hex(struct tear *t, HSTRING s, void **out)
+{
+    UINT32 wl;
+    const WCHAR *w = WindowsGetStringRawBuffer(s, &wl);
+    DWORD n = 0;
+    struct obj *o;
+    if (!CryptStringToBinaryW(w, wl, CRYPT_STRING_HEX_ANY, NULL, &n, NULL, NULL)) return E_INVALIDARG;
+    o = buffer_new(NULL, n);
+    CryptStringToBinaryW(w, wl, CRYPT_STRING_HEX_ANY, ((struct buf *)o->priv)->data, &n, NULL, NULL);
+    *out = obj_default(o);
+    return S_OK;
+}
+
+/* ---- symmetric encryption (DES, ECB, PKCS#7 only) ---- */
+
+static HRESULT WINAPI sym_names_des_ecb_pkcs7(struct tear *t, HSTRING *s) { return WindowsCreateString(L"DES_ECB_PKCS7", 13, s); }
+static HRESULT WINAPI sym_names_des_ecb(struct tear *t, HSTRING *s) { return WindowsCreateString(L"DES_ECB", 7, s); }
+
+static HRESULT WINAPI sym_open(struct tear *t, HSTRING name, void **out)
+{
+    struct obj *o = obj_new_named("Windows.Security.Cryptography.Core.SymmetricKeyAlgorithmProvider");
+    const WCHAR *n = WindowsGetStringRawBuffer(name, NULL);
+    if (!wcsicmp(n, L"DES_ECB_PKCS7")) o->priv = (void *)1;
+    else if (wcsicmp(n, L"DES_ECB")) shim_log("symmetric: unsupported algorithm %ls", n);
+    prop_set_str(o, "AlgorithmName", n);
+    *out = obj_default(o);
+    return S_OK;
+}
+
+struct sym_key {
+    BYTE key[8];
+    UINT32 len;
+    int pad;
+};
+
+static HRESULT WINAPI sym_create_key(struct tear *t, IUnknown *material, void **out)
+{
+    struct obj *o = obj_new_named("Windows.Security.Cryptography.Core.CryptographicKey");
+    struct sym_key *k = calloc(1, sizeof(*k));
+    UINT32 len;
+    BYTE *p = buffer_data(material, &len);
+    k->len = len;
+    k->pad = t->obj->priv != NULL;
+    memcpy(k->key, p, min(len, 8));
+    o->priv = k;
+    *out = obj_default(o);
+    return S_OK;
+}
+
+static HRESULT des_crypt(IUnknown *keyobj, IUnknown *data, int encrypt, void **out)
+{
+    struct obj *ko = obj_from(keyobj);
+    struct sym_key *k = ko ? ko->priv : NULL;
+    struct { BLOBHEADER h; DWORD len; BYTE key[8]; } blob;
+    HCRYPTPROV prov;
+    HCRYPTKEY key;
+    UINT32 len;
+    BYTE *p = buffer_data(data, &len), *tmp;
+    DWORD n = len, mode = CRYPT_MODE_ECB;
+    BOOL ok;
+
+    if (!k || k->len < 8) {
+        shim_log("symmetric: DES key shorter than 8 bytes (%u)", k ? k->len : 0);
+        return E_INVALIDARG;
+    }
+    /* longer key material is accepted; only its first 8 bytes are used */
+    blob.h.bType = PLAINTEXTKEYBLOB;
+    blob.h.bVersion = CUR_BLOB_VERSION;
+    blob.h.reserved = 0;
+    blob.h.aiKeyAlg = CALG_DES;
+    blob.len = 8;
+    memcpy(blob.key, k->key, 8);
+    if (!CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) return E_FAIL;
+    if (!CryptImportKey(prov, (BYTE *)&blob, sizeof(blob), 0, 0, &key)) {
+        CryptReleaseContext(prov, 0);
+        return E_FAIL;
+    }
+    CryptSetKeyParam(key, KP_MODE, (BYTE *)&mode, 0);
+    tmp = calloc(1, len + 16);
+    if (len) memcpy(tmp, p, len);
+    if (!k->pad && len % 8) {
+        shim_log("symmetric: DES_ECB data is not a multiple of 8 bytes (%u)", len);
+        ok = FALSE;
+    } else if (encrypt) ok = CryptEncrypt(key, 0, k->pad, 0, tmp, &n, len + 16);
+    else ok = CryptDecrypt(key, 0, k->pad, 0, tmp, &n);
+    if (ok) *out = obj_default(buffer_new(tmp, n));
+    else shim_log("symmetric: DES %s failed (%lu)", encrypt ? "encrypt" : "decrypt", GetLastError());
+    free(tmp);
+    CryptDestroyKey(key);
+    CryptReleaseContext(prov, 0);
+    return ok ? S_OK : E_FAIL;
+}
+
+static HRESULT WINAPI engine_encrypt(struct tear *t, IUnknown *key, IUnknown *data, IUnknown *iv, void **out)
+{
+    return des_crypt(key, data, 1, out);
+}
+
+static HRESULT WINAPI engine_decrypt(struct tear *t, IUnknown *key, IUnknown *data, IUnknown *iv, void **out)
+{
+    return des_crypt(key, data, 0, out);
+}
+
 static HRESULT WINAPI cb_random(struct tear *t, UINT32 n, void **out)
 {
     struct obj *o = buffer_new(NULL, n);
@@ -298,6 +414,14 @@ void buffer_init(void)
     override("Windows.Security.Cryptography.ICryptographicBufferStatics", "CopyToByteArray", cb_to_bytes);
     override("Windows.Security.Cryptography.ICryptographicBufferStatics", "ConvertStringToBinary", cb_from_string);
     override("Windows.Security.Cryptography.ICryptographicBufferStatics", "ConvertBinaryToString", cb_to_string);
+    override("Windows.Security.Cryptography.ICryptographicBufferStatics", "DecodeFromBase64String", cb_from_base64);
+    override("Windows.Security.Cryptography.ICryptographicBufferStatics", "DecodeFromHexString", cb_from_hex);
+    override("Windows.Security.Cryptography.Core.ISymmetricAlgorithmNamesStatics", "get_DesEcbPkcs7", sym_names_des_ecb_pkcs7);
+    override("Windows.Security.Cryptography.Core.ISymmetricAlgorithmNamesStatics", "get_DesEcb", sym_names_des_ecb);
+    override("Windows.Security.Cryptography.Core.ISymmetricKeyAlgorithmProviderStatics", "OpenAlgorithm", sym_open);
+    override("Windows.Security.Cryptography.Core.ISymmetricKeyAlgorithmProvider", "CreateSymmetricKey", sym_create_key);
+    override("Windows.Security.Cryptography.Core.ICryptographicEngineStatics", "Encrypt", engine_encrypt);
+    override("Windows.Security.Cryptography.Core.ICryptographicEngineStatics", "Decrypt", engine_decrypt);
     override("Windows.Security.Cryptography.ICryptographicBufferStatics", "GenerateRandom", cb_random);
     override("Windows.Security.Cryptography.ICryptographicBufferStatics", "GenerateRandomNumber", cb_random_number);
     override("Windows.System.Profile.IHardwareToken", "get_Id", hwtoken_id);
